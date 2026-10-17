@@ -129,9 +129,16 @@ public class AutoAccessibilityService extends AccessibilityService {
     }
 
     /**
+     * 外部/测试触发接口
+     */
+    public void handleCommand(String jsonStr) {
+        dispatchRpcMessage(jsonStr);
+    }
+
+    /**
      * 标准 JSON-RPC 2.0 消息路由器
      */
-    private void dispatchRpcMessage(String jsonStr) {
+    public void dispatchRpcMessage(String jsonStr) {
         log("收到控制报文: " + jsonStr);
         mainHandler.post(() -> {
             String rpcId = "0";
