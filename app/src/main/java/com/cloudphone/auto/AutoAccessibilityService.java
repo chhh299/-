@@ -4,6 +4,9 @@ import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
 import android.content.ClipData;
 import android.content.ClipboardManager;
+import android.content.Intent;
+import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageManager;
 import android.graphics.Path;
 import android.graphics.Rect;
 import android.os.Bundle;
@@ -15,7 +18,6 @@ import android.view.accessibility.AccessibilityNodeInfo;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import java.util.ArrayList;
 import java.util.List;
 
 public class AutoAccessibilityService extends AccessibilityService {
@@ -81,6 +83,12 @@ public class AutoAccessibilityService extends AccessibilityService {
                 reply.put("reply_for", action);
 
                 switch (action) {
+                    case "launch_app":
+                        String appName = json.getString("name");
+                        success = launchAppByName(appName);
+                        reply.put("app", appName);
+                        break;
+
                     case "click_text":
                         String text = json.getString("text");
                         success = clickByText(text);
@@ -147,6 +155,29 @@ public class AutoAccessibilityService extends AccessibilityService {
         });
     }
 
+    /** 通过应用中文名称精准启动 App */
+    private boolean launchAppByName(String appName) {
+        try {
+            PackageManager pm = getPackageManager();
+            List<ApplicationInfo> apps = pm.getInstalledApplications(0);
+            for (ApplicationInfo app : apps) {
+                String label = pm.getApplicationLabel(app).toString();
+                if (label.contains(appName)) {
+                    Intent intent = pm.getLaunchIntentForPackage(app.packageName);
+                    if (intent != null) {
+                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                        startActivity(intent);
+                        log("已启动应用: " + label + " (" + app.packageName + ")");
+                        return true;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log("启动应用异常: " + e.getMessage());
+        }
+        return false;
+    }
+
     private void sendReply(String replyText) {
         if (clipboardManager != null) {
             ClipData clip = ClipData.newPlainText("cloud_reply", replyText);
@@ -154,7 +185,7 @@ public class AutoAccessibilityService extends AccessibilityService {
         }
     }
 
-    /** 按文字查找并点击 */
+    /** 按文字查找并点击（支持向父节点回溯及坐标中心点回退保底） */
     private boolean clickByText(String text) {
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null) return false;
@@ -180,14 +211,24 @@ public class AutoAccessibilityService extends AccessibilityService {
         return false;
     }
 
-    /** 递归寻找并触发点击 */
+    /** 递归寻找并触发点击，若节点本身不可点（如桌面文字），回退为绝对矩形中心手势模拟点击 */
     private boolean performClick(AccessibilityNodeInfo node) {
         if (node == null) return false;
         if (node.isClickable()) {
             return node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
         }
         AccessibilityNodeInfo parent = node.getParent();
-        return parent != null && performClick(parent);
+        if (parent != null && performClick(parent)) {
+            return true;
+        }
+        // 关键保底兜底：取其在屏幕上的矩形中心点触发手势点击
+        Rect rect = new Rect();
+        node.getBoundsInScreen(rect);
+        if (rect.width() > 0 && rect.height() > 0) {
+            clickCoordinate(rect.centerX(), rect.centerY());
+            return true;
+        }
+        return false;
     }
 
     /** 直接设置文本内容（免弹软键盘） */
@@ -215,7 +256,7 @@ public class AutoAccessibilityService extends AccessibilityService {
         Path path = new Path();
         path.moveTo(x, y);
         GestureDescription.Builder builder = new GestureDescription.Builder();
-        builder.addStroke(new GestureDescription.StrokeDescription(path, 0, 50));
+        builder.addStroke(new GestureDescription.StrokeDescription(path, 0, 100));
         dispatchGesture(builder.build(), null, null);
     }
 
