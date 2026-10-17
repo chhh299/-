@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">云机自动化助手</string>
+    <string name="service_description">中国移动云手机专用的后台无障碍自动化守护服务，接收指令完成屏幕触控与界面操作。</string>
+    <string name="service_status_disabled">无障碍服务状态：未开启</string>
+    <string name="service_status_enabled">无障碍服务状态：运行中 (已就绪)</string>
+    <string name="btn_open_settings">打开系统无障碍设置</string>
+    <string name="btn_test_cmd">模拟执行测试指令</string>
+    <string name="log_title">实时指令日志：</string>
+</resources>
