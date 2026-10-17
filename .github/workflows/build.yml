@@ -46,8 +46,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'
         with:
-          tag_name: v1.0.1
-          name: Cloud Auto Service v1.0.1
+          tag_name: v2.0.0
+          name: Cloud Auto Service v2.0.0
           body: |
             ## 139 移动云手机 - 无障碍自动化守护 APK
             - 支持 WebRTC DataChannel 剪贴板指令监听
