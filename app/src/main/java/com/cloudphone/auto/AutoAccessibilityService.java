@@ -228,8 +228,8 @@ public class AutoAccessibilityService extends AccessibilityService {
                 timeoutResp.put("error", makeError(-32000, "EXECUTION_TIMEOUT"));
                 return timeoutResp.toString();
             }
-        } catch (InterruptedException e) {
-            return "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":\"INTERRUPTED\"}}";
+        } catch (Exception e) {
+            return "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":\"EXCEPTION: " + e.getMessage() + "\"}}";
         }
 
         return responseRef.get();
