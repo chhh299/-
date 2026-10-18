@@ -13,6 +13,12 @@ import android.widget.TextView;
 import android.widget.Toast;
 import androidx.appcompat.app.AppCompatActivity;
 
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
+import java.net.Socket;
+
 public class MainActivity extends AppCompatActivity implements AutoAccessibilityService.LogCallback {
     private TextView tvStatus;
     private TextView tvTcpStatus;
@@ -28,6 +34,9 @@ public class MainActivity extends AppCompatActivity implements AutoAccessibility
     private static final String KEY_IP = "target_ip";
     private static final String KEY_PORT = "target_port";
 
+    private Thread clientThread = null;
+    private volatile boolean isRunning = false;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -42,10 +51,10 @@ public class MainActivity extends AppCompatActivity implements AutoAccessibility
         btnSaveConnect = findViewById(R.id.btn_save_connect);
         btnTestCmd = findViewById(R.id.btn_test_cmd);
 
-        // 加载历史配置
+        // 加载历史配置 (默认对准 OpenWrt 192.168.193.246:19389)
         SharedPreferences sp = getSharedPreferences(PREF_NAME, MODE_PRIVATE);
-        String savedIp = sp.getString(KEY_IP, "192.168.193.51");
-        int savedPort = sp.getInt(KEY_PORT, 19388);
+        String savedIp = sp.getString(KEY_IP, "192.168.193.246");
+        int savedPort = sp.getInt(KEY_PORT, 19389);
         etTargetIp.setText(savedIp);
         etTargetPort.setText(String.valueOf(savedPort));
 
@@ -63,23 +72,107 @@ public class MainActivity extends AppCompatActivity implements AutoAccessibility
             }
             int port = Integer.parseInt(portStr);
             sp.edit().putString(KEY_IP, ip).putInt(KEY_PORT, port).apply();
-            Toast.makeText(this, "已保存配置！正在尝试连接对端: " + ip + ":" + port, Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "正在建立连接至: " + ip + ":" + port, Toast.LENGTH_SHORT).show();
 
-            if (AutoAccessibilityService.instance != null) {
-                AutoAccessibilityService.instance.reconnectClientSocket(ip, port);
-            }
+            // 无论无障碍服务是否启动，前台立刻启动长连接线程连接对端 (OpenWrt / PC)
+            startConnection(ip, port);
         });
 
         btnTestCmd.setOnClickListener(v -> {
             if (AutoAccessibilityService.instance != null) {
                 AutoAccessibilityService.instance.handleCommand("{\"jsonrpc\":\"2.0\",\"id\":\"test\",\"method\":\"dump_ui\",\"params\":{\"__dir\":\"c2s\"}}");
-                Toast.makeText(this, "已触发 UI 布局抓取测试", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, "已触发 UI 抓取测试", Toast.LENGTH_SHORT).show();
             } else {
-                Toast.makeText(this, "请先在系统设置中开启本无障碍服务！", Toast.LENGTH_LONG).show();
+                Toast.makeText(this, "请在系统设置中先开启无障碍服务！", Toast.LENGTH_LONG).show();
             }
         });
 
         AutoAccessibilityService.logCallback = this;
+
+        // 打开 App 自动根据已存配置尝试连接对端
+        startConnection(savedIp, savedPort);
+    }
+
+    private synchronized void startConnection(String ip, int port) {
+        if (clientThread != null) {
+            isRunning = false;
+            clientThread.interrupt();
+            clientThread = null;
+        }
+
+        isRunning = true;
+        clientThread = new Thread(() -> {
+            while (isRunning && !Thread.currentThread().isInterrupted()) {
+                Socket socket = null;
+                try {
+                    appendLog("[TCP] 正在连接对端: " + ip + ":" + port + "...");
+                    socket = new Socket(ip, port);
+                    appendLog("[TCP] ★ 成功连上对端！(" + ip + ":" + port + ")");
+                    updateTcpStatus(true, ip + ":" + port);
+
+                    BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), "UTF-8"));
+                    BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), "UTF-8"));
+
+                    while (isRunning && !socket.isClosed()) {
+                        String line = reader.readLine();
+                        if (line == null) {
+                            appendLog("[TCP] 对端已断开连接");
+                            break;
+                        }
+                        String trimmed = line.trim();
+                        if (!trimmed.isEmpty()) {
+                            appendLog("[收到指令] " + trimmed);
+                            String resp = "";
+                            if (AutoAccessibilityService.instance != null) {
+                                resp = AutoAccessibilityService.instance.executeRpcSync(trimmed);
+                            } else {
+                                resp = "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32000,\"message\":\"ACCESSIBILITY_SERVICE_NOT_ENABLED\"}}";
+                            }
+                            writer.write(resp + "\n");
+                            writer.flush();
+                            appendLog("[发送应答] 交付完成");
+                        }
+                    }
+                } catch (Exception e) {
+                    appendLog("[TCP 连接异常/等待重连]: " + e.getMessage());
+                    updateTcpStatus(false, e.getMessage());
+                } finally {
+                    if (socket != null) {
+                        try { socket.close(); } catch (Exception ignored) {}
+                    }
+                }
+
+                try {
+                    Thread.sleep(5000);
+                } catch (InterruptedException e) {
+                    break;
+                }
+            }
+        });
+        clientThread.start();
+    }
+
+    private void updateTcpStatus(boolean connected, String detail) {
+        runOnUiThread(() -> {
+            if (tvTcpStatus != null) {
+                if (connected) {
+                    tvTcpStatus.setText("TCP 状态: 已连接 (" + detail + ")");
+                    tvTcpStatus.setBackgroundColor(Color.parseColor("#C8E6C9"));
+                } else {
+                    tvTcpStatus.setText("TCP 状态: 未连接 (" + detail + ")");
+                    tvTcpStatus.setBackgroundColor(Color.parseColor("#FFCDD2"));
+                }
+            }
+        });
+    }
+
+    private void appendLog(String msg) {
+        runOnUiThread(() -> {
+            logBuilder.append(msg).append("\n");
+            if (tvLog != null) {
+                tvLog.setText(logBuilder.toString());
+            }
+        });
     }
 
     @Override
@@ -128,18 +221,16 @@ public class MainActivity extends AppCompatActivity implements AutoAccessibility
 
     @Override
     public void onLog(String message) {
-        logBuilder.append(message).append("\n");
-        if (tvLog != null) {
-            tvLog.setText(logBuilder.toString());
-        }
-        if (tvTcpStatus != null && message.contains("[TCP]")) {
-            tvTcpStatus.setText("TCP 状态: " + message);
-        }
+        appendLog(message);
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        isRunning = false;
+        if (clientThread != null) {
+            clientThread.interrupt();
+        }
         AutoAccessibilityService.logCallback = null;
     }
 }
