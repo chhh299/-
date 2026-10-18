@@ -64,7 +64,7 @@ public class AutoAccessibilityService extends AccessibilityService {
                             if (text != null) {
                                 String str = text.toString().trim();
                                 // 1. 回环防御：若为自身发出的 s2c 响应，直接丢弃
-                                if (str.contains("\"__dir\":\"s2c\"") || str.contains("\"reply_for\"")) return;
+                                if (str.contains("\"__dir\":\"s2c\"") || str.contains("\"__dir\": \"s2c\"") || str.contains("\"reply_for\"")) return;
                                 // 2. 防重放校验
                                 if (!str.equals(lastHandledRaw) && str.startsWith("{") && str.endsWith("}")) {
                                     lastHandledRaw = str;
@@ -468,22 +468,23 @@ public class AutoAccessibilityService extends AccessibilityService {
     }
 
     /**
-     * UI 树智能剪枝抓取算法：限制深度 <= 12，严格 recycle 回收 Binder 句柄，体积 <= 5KB
+     * UI 树智能剪枝抓取算法：限制深度 <= 12，严格 recycle 回收 Binder 句柄，体积严格 <= 5KB (4500 字节安全预算)
      */
     private JSONArray dumpCurrentUiPruned() {
         JSONArray array = new JSONArray();
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null) return array;
         try {
-            traverseAndPrune(root, array, 0);
+            int[] currentBytes = new int[]{2}; // 初始计入 "[]" 2 字节
+            traverseAndPrune(root, array, 0, currentBytes);
         } finally {
             root.recycle();
         }
         return array;
     }
 
-    private void traverseAndPrune(AccessibilityNodeInfo node, JSONArray array, int depth) {
-        if (node == null || depth > 12 || array.length() >= 80) return;
+    private void traverseAndPrune(AccessibilityNodeInfo node, JSONArray array, int depth, int[] currentBytes) {
+        if (node == null || depth > 12 || array.length() >= 60 || currentBytes[0] >= 4200) return;
         try {
             CharSequence text = node.getText();
             CharSequence desc = node.getContentDescription();
@@ -504,16 +505,24 @@ public class AutoAccessibilityService extends AccessibilityService {
                     item.put("y", rect.top);
                     item.put("w", rect.width());
                     item.put("h", rect.height());
-                    array.put(item);
+
+                    int itemLen = item.toString().getBytes("UTF-8").length + 1; // 计入逗号
+                    if (currentBytes[0] + itemLen <= 4500) {
+                        array.put(item);
+                        currentBytes[0] += itemLen;
+                    } else {
+                        return; // 超出 4.5KB 严格预算即刻停止收集
+                    }
                 }
             }
 
             int count = node.getChildCount();
             for (int i = 0; i < count; i++) {
+                if (currentBytes[0] >= 4200) break;
                 AccessibilityNodeInfo child = node.getChild(i);
                 if (child != null) {
                     try {
-                        traverseAndPrune(child, array, depth + 1);
+                        traverseAndPrune(child, array, depth + 1, currentBytes);
                     } finally {
                         child.recycle(); // 强制显式释放 Binder 代理句柄，杜绝死锁假死
                     }
