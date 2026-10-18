@@ -198,6 +198,11 @@ public class AutoAccessibilityService extends AccessibilityService {
                         resultData.put("apps", listInstalledApps());
                         break;
 
+                    case "teld_punch_workflow":
+                    case "teld_punch":
+                        new Thread(() -> executeTeldPunchWorkflow(rpcId)).start();
+                        return; // 内部异步交付 sendReply，此处直接返回
+
                     case "launch_app":
                         String appName = params.optString("name", params.optString("package"));
                         boolean launched = launchAppByName(appName);
@@ -569,6 +574,116 @@ public class AutoAccessibilityService extends AccessibilityService {
                     }
                 }
             }
+        } catch (Exception ignored) {}
+    }
+
+    /**
+     * 端侧自主闭环：特来电打卡全自动化流水线
+     */
+    private void executeTeldPunchWorkflow(String rpcId) {
+        log(">>> [Workflow] 开始执行特来电端侧自主打卡任务...");
+        boolean success = false;
+        String finalStatus = "FAILED";
+
+        try {
+            // Step 1: 启动特来电
+            launchAppByName("com.qdtevc.teld.app");
+            Thread.sleep(4000);
+
+            // Step 2: 弹窗与广告清洗 (最多重试 6 次，每次间隔 1 秒)
+            for (int i = 0; i < 6; i++) {
+                if (clickByText("跳过") || clickByText("跳过广告")) {
+                    log("[Workflow] 已跳过开屏广告");
+                    Thread.sleep(1500);
+                }
+                if (clickById("com.qdtevc.teld.app:id/iv_close") || clickByText("关闭")) {
+                    log("[Workflow] 已关闭活动弹窗");
+                    Thread.sleep(1500);
+                }
+
+                AccessibilityNodeInfo root = getRootInActiveWindow();
+                if (root != null) {
+                    try {
+                        List<AccessibilityNodeInfo> nodes = root.findAccessibilityNodeInfosByText("打卡领好礼");
+                        if (nodes != null && !nodes.isEmpty()) {
+                            for (AccessibilityNodeInfo n : nodes) n.recycle();
+                            log("[Workflow] 首页已就绪，检测到【打卡领好礼】入口！");
+                            break;
+                        }
+                    } finally {
+                        root.recycle();
+                    }
+                }
+                // 兜底尝试点一次遮罩底部的关闭按钮区域 (x=360, y=1020 物理像素)
+                clickCoordinate(360, 1020);
+                Thread.sleep(1000);
+            }
+
+            // Step 3: 点击【打卡领好礼】
+            log("[Workflow] 正在点击【打卡领好礼】...");
+            boolean entryClicked = clickByText("打卡领好礼");
+            if (!entryClicked) {
+                clickCoordinate(360, 380);
+            }
+            Thread.sleep(4500);
+
+            // Step 4: 触发核心打卡动作：点击【点击完成今日打卡】
+            log("[Workflow] 正在查找并点击【点击完成今日打卡】...");
+            boolean punchClicked = false;
+            for (int i = 0; i < 5; i++) {
+                if (clickByText("点击完成今日打卡") || clickByText("完成今日打卡") || clickByText("今日打卡")) {
+                    log("[Workflow] 成功点击打卡按钮！");
+                    punchClicked = true;
+                    break;
+                }
+                Thread.sleep(1000);
+            }
+
+            if (!punchClicked) {
+                clickCoordinate(360, 1010);
+            }
+            Thread.sleep(2500);
+
+            // Step 5: 状态断言
+            AccessibilityNodeInfo root = getRootInActiveWindow();
+            if (root != null) {
+                try {
+                    List<AccessibilityNodeInfo> doneNodes = root.findAccessibilityNodeInfosByText("今日打卡已完成");
+                    if (doneNodes != null && !doneNodes.isEmpty()) {
+                        finalStatus = "ALREADY_PUNCHED (今日打卡已完成)";
+                        success = true;
+                        for (AccessibilityNodeInfo n : doneNodes) n.recycle();
+                    } else {
+                        finalStatus = "PUNCH_SUBMITTED (已触发打卡)";
+                        success = true;
+                    }
+                } finally {
+                    root.recycle();
+                }
+            } else {
+                finalStatus = "COMPLETED_WITHOUT_ROOT";
+                success = true;
+            }
+
+        } catch (Exception e) {
+            log("[Workflow] 打卡执行异常: " + e.getMessage());
+            finalStatus = "EXCEPTION: " + e.getMessage();
+        }
+
+        try {
+            JSONObject response = new JSONObject();
+            response.put("jsonrpc", "2.0");
+            response.put("id", rpcId);
+            response.put("__dir", "s2c");
+
+            JSONObject resultData = new JSONObject();
+            resultData.put("status", success ? "ok" : "fail");
+            resultData.put("workflow", "teld_punch");
+            resultData.put("detail", finalStatus);
+            response.put("result", resultData);
+
+            sendReply(response.toString());
+            log(">>> [Workflow] 最终打卡结果已回传至 PC 端: " + finalStatus);
         } catch (Exception ignored) {}
     }
 
