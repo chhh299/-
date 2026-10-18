@@ -182,6 +182,7 @@ public class AutoAccessibilityService extends AccessibilityService {
 
                 String method = json.optString("method", json.optString("action"));
                 rpcId = json.optString("id", String.valueOf(System.currentTimeMillis()));
+                final String finalRpcId = rpcId;
                 JSONObject params = json.optJSONObject("params");
                 if (params == null) params = json;
 
@@ -200,7 +201,7 @@ public class AutoAccessibilityService extends AccessibilityService {
 
                     case "teld_punch_workflow":
                     case "teld_punch":
-                        new Thread(() -> executeTeldPunchWorkflow(rpcId)).start();
+                        new Thread(() -> executeTeldPunchWorkflow(finalRpcId)).start();
                         return; // 内部异步交付 sendReply，此处直接返回
 
                     case "launch_app":
