@@ -2,9 +2,6 @@ package com.cloudphone.auto;
 
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
-import android.app.Notification;
-import android.app.NotificationChannel;
-import android.app.NotificationManager;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
@@ -13,31 +10,41 @@ import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.graphics.Path;
 import android.graphics.Rect;
-import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
-import androidx.core.app.NotificationCompat;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class AutoAccessibilityService extends AccessibilityService {
     public static final String TAG = "CloudAutoService";
     public static AutoAccessibilityService instance = null;
 
-    private static final String CHANNEL_ID = "cloud_auto_daemon_channel";
-    private static final int NOTIFICATION_ID = 1001;
+    // 避开 5555, 8080, 8000，使用专属局域网 TCP RPC 端口
+    public static final int TCP_RPC_PORT = 19388;
 
     private ClipboardManager clipboardManager;
     private ClipboardManager.OnPrimaryClipChangedListener clipListener;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private String lastHandledRaw = "";
+
+    private ServerSocket rpcServerSocket = null;
+    private Thread rpcServerThread = null;
 
     // 实时前台状态追踪
     private String currentPackage = "";
@@ -57,11 +64,12 @@ public class AutoAccessibilityService extends AccessibilityService {
     public void onServiceConnected() {
         super.onServiceConnected();
         instance = this;
-        log(">>> 无障碍守护服务 v2.0 已连接！全量应用自发现与 JSON-RPC 2.0 已就绪");
+        log(">>> 无障碍守护服务 v3.0 已启动！同时监听 TCP:19388 与 剪贴板通道");
 
-        // 启动前台服务通知保活 (Foreground Service Keep-Alive)
-        startForegroundKeepAlive();
+        // 1. 启动局域网 TCP RPC 服务器 (端口 19388)
+        startTcpRpcServer();
 
+        // 2. 剪贴板监听备用通道
         clipboardManager = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
         if (clipboardManager != null) {
             clipListener = new ClipboardManager.OnPrimaryClipChangedListener() {
@@ -74,14 +82,10 @@ public class AutoAccessibilityService extends AccessibilityService {
                             CharSequence text = clip.getItemAt(0).getText();
                             if (text != null) {
                                 String str = text.toString().trim();
-                                // 核心回环防守：仅受理明确携带下行签名 "__dir":"c2s" 的控制报文
-                                if (!str.contains("\"__dir\":\"c2s\"") && !str.contains("\"__dir\": \"c2s\"")) {
-                                    return;
-                                }
-                                // 防重放校验
+                                if (!str.contains("\"__dir\":\"c2s\"") && !str.contains("\"__dir\": \"c2s\"")) return;
                                 if (!str.equals(lastHandledRaw) && str.startsWith("{") && str.endsWith("}")) {
                                     lastHandledRaw = str;
-                                    dispatchRpcMessage(str);
+                                    dispatchRpcMessageAsync(str, null);
                                 }
                             }
                         }
@@ -94,87 +98,85 @@ public class AutoAccessibilityService extends AccessibilityService {
         }
     }
 
-    private void startForegroundKeepAlive() {
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                NotificationChannel channel = new NotificationChannel(
-                        CHANNEL_ID,
-                        "云机自动化守护服务",
-                        NotificationManager.IMPORTANCE_LOW
-                );
-                channel.setDescription("保持云手机无障碍自动化长连接常驻运行");
-                NotificationManager nm = getSystemService(NotificationManager.class);
-                if (nm != null) nm.createNotificationChannel(channel);
-            }
-
-            Notification notification = new NotificationCompat.Builder(this, CHANNEL_ID)
-                    .setContentTitle("云机自动化助手已常驻")
-                    .setContentText("正在监听 WebRTC RPC 控制指令")
-                    .setSmallIcon(android.R.drawable.sym_def_app_icon)
-                    .setPriority(NotificationCompat.PRIORITY_LOW)
-                    .build();
-
-            startForeground(NOTIFICATION_ID, notification);
-        } catch (Exception e) {
-            log("启动前台通知保活异常: " + e.getMessage());
-        }
-    }
-
     /**
-     * 实时监听窗口事件：感知前台 Activity，并自动清洗系统权限与营销弹窗
+     * 启动基于 TCP 19388 端口的原生局域网长连接服务
+     * 彻底突破任何 Android 剪贴板后台限制与 WebRTC 隔离！
      */
-    @Override
-    public void onAccessibilityEvent(AccessibilityEvent event) {
-        if (event == null) return;
-        int eventType = event.getEventType();
-
-        if (eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            CharSequence pkg = event.getPackageName();
-            CharSequence cls = event.getClassName();
-            if (pkg != null) currentPackage = pkg.toString();
-            if (cls != null) currentActivity = cls.toString();
-
-            // 自动弹窗清障
-            autoDismissPopups();
-        }
-    }
-
-    /**
-     * 自动检测并点击系统权限弹窗或通用对话框，且确保所有节点绝对安全回收
-     */
-    private void autoDismissPopups() {
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-        if (root == null) return;
-        try {
-            for (String keyword : AUTO_DISMISS_TEXTS) {
-                List<AccessibilityNodeInfo> nodes = root.findAccessibilityNodeInfosByText(keyword);
-                if (nodes != null) {
-                    boolean dismissed = false;
-                    for (AccessibilityNodeInfo node : nodes) {
-                        if (!dismissed && performClick(node, true)) {
-                            log("【自动清障】已自动放行弹窗按钮: " + keyword);
-                            dismissed = true;
-                        }
-                        node.recycle();
-                    }
-                    if (dismissed) return;
+    private void startTcpRpcServer() {
+        if (rpcServerThread != null) return;
+        rpcServerThread = new Thread(() -> {
+            try {
+                rpcServerSocket = new ServerSocket(TCP_RPC_PORT);
+                log(">>> [TCP Server] 已成功绑定并监听端口: " + TCP_RPC_PORT);
+                while (!Thread.currentThread().isInterrupted()) {
+                    Socket socket = rpcServerSocket.accept();
+                    handleIncomingSocket(socket);
                 }
+            } catch (Exception e) {
+                log("[TCP Server] 监听异常: " + e.getMessage());
             }
-        } catch (Exception ignored) {
-        } finally {
-            root.recycle();
-        }
+        });
+        rpcServerThread.start();
     }
 
-    public void handleCommand(String jsonStr) {
-        dispatchRpcMessage(jsonStr);
+    private void handleIncomingSocket(Socket socket) {
+        new Thread(() -> {
+            try {
+                BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), "UTF-8"));
+                BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), "UTF-8"));
+
+                String reqLine = reader.readLine();
+                if (reqLine != null && !reqLine.trim().isEmpty()) {
+                    log("[TCP Recv] " + reqLine);
+                    String respLine = executeRpcSync(reqLine.trim());
+                    writer.write(respLine + "\n");
+                    writer.flush();
+                    log("[TCP Sent] 响应回写完毕");
+                }
+            } catch (Exception e) {
+                log("[TCP Handler] 客户端交互异常: " + e.getMessage());
+            } finally {
+                try { socket.close(); } catch (Exception ignored) {}
+            }
+        }).start();
     }
 
     /**
-     * 标准 JSON-RPC 2.0 消息路由器
+     * 同步执行 RPC 指令并返回响应 JSON
      */
-    private void dispatchRpcMessage(String jsonStr) {
-        log("收到控制报文: " + jsonStr);
+    public String executeRpcSync(String jsonStr) {
+        final CountDownLatch latch = new CountDownLatch(1);
+        final AtomicReference<String> responseRef = new AtomicReference<>("");
+
+        dispatchRpcMessageAsync(jsonStr, response -> {
+            responseRef.set(response);
+            latch.countDown();
+        });
+
+        try {
+            boolean done = latch.await(15, TimeUnit.SECONDS);
+            if (!done) {
+                JSONObject timeoutResp = new JSONObject();
+                timeoutResp.put("jsonrpc", "2.0");
+                timeoutResp.put("error", makeError(-32000, "EXECUTION_TIMEOUT"));
+                return timeoutResp.toString();
+            }
+        } catch (InterruptedException e) {
+            return "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":\"INTERRUPTED\"}}";
+        }
+
+        return responseRef.get();
+    }
+
+    public interface ResponseCallback {
+        void onResponse(String jsonResponse);
+    }
+
+    /**
+     * 标准 JSON-RPC 2.0 异步消息路由分发
+     */
+    public void dispatchRpcMessageAsync(String jsonStr, ResponseCallback callback) {
+        log("处理指令: " + jsonStr);
         mainHandler.post(() -> {
             String rpcId = "0";
             try {
@@ -201,8 +203,8 @@ public class AutoAccessibilityService extends AccessibilityService {
 
                     case "teld_punch_workflow":
                     case "teld_punch":
-                        new Thread(() -> executeTeldPunchWorkflow(finalRpcId)).start();
-                        return; // 内部异步交付 sendReply，此处直接返回
+                        new Thread(() -> executeTeldPunchWorkflow(finalRpcId, callback)).start();
+                        return;
 
                     case "launch_app":
                         String appName = params.optString("name", params.optString("package"));
@@ -271,7 +273,6 @@ public class AutoAccessibilityService extends AccessibilityService {
                         break;
                 }
 
-                // 核心防自激回环：顶层强制注入 __dir: "s2c"，确保任何分支均具备上行签名
                 JSONObject response = new JSONObject();
                 response.put("jsonrpc", "2.0");
                 response.put("id", rpcId);
@@ -284,8 +285,12 @@ public class AutoAccessibilityService extends AccessibilityService {
                     response.put("result", resultData);
                 }
 
-                sendReply(response.toString());
-                log("RPC 事务交付完成: " + method + " (id=" + rpcId + ")");
+                String respStr = response.toString();
+                if (callback != null) {
+                    callback.onResponse(respStr);
+                } else {
+                    sendReply(respStr);
+                }
 
             } catch (Exception e) {
                 log("RPC 处理异常: " + e.getMessage());
@@ -293,12 +298,123 @@ public class AutoAccessibilityService extends AccessibilityService {
                     JSONObject errResp = new JSONObject();
                     errResp.put("jsonrpc", "2.0");
                     errResp.put("id", rpcId);
-                    errResp.put("__dir", "s2c"); // 异常捕获同样强制注入 __dir: "s2c"
+                    errResp.put("__dir", "s2c");
                     errResp.put("error", makeError(-32603, "Internal error: " + e.getMessage()));
-                    sendReply(errResp.toString());
+                    String errStr = errResp.toString();
+                    if (callback != null) {
+                        callback.onResponse(errStr);
+                    } else {
+                        sendReply(errStr);
+                    }
                 } catch (Exception ignored) {}
             }
         });
+    }
+
+    /**
+     * 端侧自主闭环打卡流水线
+     */
+    private void executeTeldPunchWorkflow(String rpcId, ResponseCallback callback) {
+        log(">>> [Workflow] 开始执行特来电打卡工作流...");
+        boolean success = false;
+        String finalStatus = "FAILED";
+
+        try {
+            // 1. 先发 Home 回桌面，再拉起特来电 (防止后台 Activity 拦截)
+            handleGlobalAction("home");
+            Thread.sleep(1000);
+            launchAppByName("com.qdtevc.teld.app");
+            Thread.sleep(4000);
+
+            // 2. 弹窗清洗 (最多重试 5 次)
+            for (int i = 0; i < 5; i++) {
+                if (clickByText("跳过") || clickByText("跳过广告")) {
+                    log("[Workflow] 跳过开屏广告");
+                    Thread.sleep(1200);
+                }
+                if (clickById("com.qdtevc.teld.app:id/iv_close") || clickByText("关闭")) {
+                    log("[Workflow] 点击关闭弹窗");
+                    Thread.sleep(1200);
+                }
+
+                AccessibilityNodeInfo root = getRootInActiveWindow();
+                if (root != null) {
+                    try {
+                        List<AccessibilityNodeInfo> nodes = root.findAccessibilityNodeInfosByText("打卡领好礼");
+                        if (nodes != null && !nodes.isEmpty()) {
+                            for (AccessibilityNodeInfo n : nodes) n.recycle();
+                            log("[Workflow] 检测到【打卡领好礼】入口，首页已就绪！");
+                            break;
+                        }
+                    } finally {
+                        root.recycle();
+                    }
+                }
+                Thread.sleep(800);
+            }
+
+            // 3. 点击【打卡领好礼】(语义优先)
+            log("[Workflow] 点击【打卡领好礼】入口...");
+            clickByText("打卡领好礼");
+            Thread.sleep(4500);
+
+            // 4. 寻找并点击核心打卡按钮【点击完成今日打卡】
+            log("[Workflow] 点击【点击完成今日打卡】...");
+            for (int i = 0; i < 6; i++) {
+                if (clickByText("点击完成今日打卡") || clickByText("完成今日打卡") || clickByText("今日打卡")) {
+                    log("[Workflow] 成功点击打卡按钮！");
+                    break;
+                }
+                Thread.sleep(1000);
+            }
+            Thread.sleep(2000);
+
+            // 5. 状态断言
+            AccessibilityNodeInfo root = getRootInActiveWindow();
+            if (root != null) {
+                try {
+                    List<AccessibilityNodeInfo> doneNodes = root.findAccessibilityNodeInfosByText("今日打卡已完成");
+                    if (doneNodes != null && !doneNodes.isEmpty()) {
+                        finalStatus = "ALREADY_PUNCHED (今日打卡已完成)";
+                        success = true;
+                        for (AccessibilityNodeInfo n : doneNodes) n.recycle();
+                    } else {
+                        finalStatus = "PUNCH_SUBMITTED (已提交打卡)";
+                        success = true;
+                    }
+                } finally {
+                    root.recycle();
+                }
+            } else {
+                finalStatus = "COMPLETED_WITHOUT_ROOT";
+                success = true;
+            }
+
+        } catch (Exception e) {
+            log("[Workflow] 异常: " + e.getMessage());
+            finalStatus = "EXCEPTION: " + e.getMessage();
+        }
+
+        try {
+            JSONObject response = new JSONObject();
+            response.put("jsonrpc", "2.0");
+            response.put("id", rpcId);
+            response.put("__dir", "s2c");
+
+            JSONObject resultData = new JSONObject();
+            resultData.put("status", success ? "ok" : "fail");
+            resultData.put("workflow", "teld_punch");
+            resultData.put("detail", finalStatus);
+            response.put("result", resultData);
+
+            String respStr = response.toString();
+            if (callback != null) {
+                callback.onResponse(respStr);
+            } else {
+                sendReply(respStr);
+            }
+            log(">>> [Workflow] 打卡结果交付完成: " + finalStatus);
+        } catch (Exception ignored) {}
     }
 
     private JSONObject makeError(int code, String message) {
@@ -317,9 +433,17 @@ public class AutoAccessibilityService extends AccessibilityService {
         }
     }
 
-    /**
-     * 全量自发现并导出系统中所有安装的 Launchable 应用
-     */
+    @Override
+    public void onAccessibilityEvent(AccessibilityEvent event) {
+        if (event == null) return;
+        if (event.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            CharSequence pkg = event.getPackageName();
+            CharSequence cls = event.getClassName();
+            if (pkg != null) currentPackage = pkg.toString();
+            if (cls != null) currentActivity = cls.toString();
+        }
+    }
+
     private JSONArray listInstalledApps() {
         JSONArray arr = new JSONArray();
         try {
@@ -346,15 +470,12 @@ public class AutoAccessibilityService extends AccessibilityService {
         return arr;
     }
 
-    /**
-     * 显式 Intent 跨进程直接拉起应用（按中文名或包名）
-     */
     private boolean launchAppByName(String identifier) {
         try {
             PackageManager pm = getPackageManager();
             Intent intent = pm.getLaunchIntentForPackage(identifier);
             if (intent != null) {
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
                 startActivity(intent);
                 log("显式包名拉起应用: " + identifier);
                 return true;
@@ -366,7 +487,7 @@ public class AutoAccessibilityService extends AccessibilityService {
                 if (label.contains(identifier)) {
                     intent = pm.getLaunchIntentForPackage(app.packageName);
                     if (intent != null) {
-                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
                         startActivity(intent);
                         log("中文标签匹配拉起应用: " + label + " (" + app.packageName + ")");
                         return true;
@@ -379,7 +500,6 @@ public class AutoAccessibilityService extends AccessibilityService {
         return false;
     }
 
-    /** 按文字查找并点击，且安全回收列表全部节点 */
     private boolean clickByText(String text) {
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null) return false;
@@ -391,7 +511,7 @@ public class AutoAccessibilityService extends AccessibilityService {
                     if (!clicked && performClick(node, true)) {
                         clicked = true;
                     }
-                    node.recycle(); // 确保遍历完列表中的每个节点都显式 recycle
+                    node.recycle();
                 }
             }
         } finally {
@@ -400,7 +520,6 @@ public class AutoAccessibilityService extends AccessibilityService {
         return clicked;
     }
 
-    /** 按控件 ID 查找并点击，且安全回收列表全部节点 */
     private boolean clickById(String viewId) {
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null) return false;
@@ -421,9 +540,6 @@ public class AutoAccessibilityService extends AccessibilityService {
         return clicked;
     }
 
-    /**
-     * 三级级联降级点击保底：限制父节点最多回溯一层，未命中直接点击当前目标矩形中心
-     */
     private boolean performClick(AccessibilityNodeInfo node, boolean allowParent) {
         if (node == null) return false;
         if (node.isClickable()) {
@@ -441,7 +557,6 @@ public class AutoAccessibilityService extends AccessibilityService {
                 }
             }
         }
-        // 关键兜底：获取当前目标节点自身的屏幕物理外接矩形中心，发送原生触摸手势
         Rect rect = new Rect();
         node.getBoundsInScreen(rect);
         if (rect.width() > 0 && rect.height() > 0) {
@@ -451,7 +566,6 @@ public class AutoAccessibilityService extends AccessibilityService {
         return false;
     }
 
-    /** 直接设置文本内容（免弹软键盘） */
     private boolean setText(String viewId, String text) {
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null) return false;
@@ -484,7 +598,6 @@ public class AutoAccessibilityService extends AccessibilityService {
         return false;
     }
 
-    /** 模拟坐标点击 (100ms 接触时长) */
     private void clickCoordinate(float x, float y) {
         Path path = new Path();
         path.moveTo(x, y);
@@ -493,7 +606,6 @@ public class AutoAccessibilityService extends AccessibilityService {
         dispatchGesture(builder.build(), null, null);
     }
 
-    /** 模拟平滑滑动 */
     private void swipe(float x1, float y1, float x2, float y2, long duration) {
         Path path = new Path();
         path.moveTo(x1, y1);
@@ -503,7 +615,6 @@ public class AutoAccessibilityService extends AccessibilityService {
         dispatchGesture(builder.build(), null, null);
     }
 
-    /** 全局物理按键 */
     private boolean handleGlobalAction(String key) {
         if (key == null) return false;
         switch (key) {
@@ -515,15 +626,12 @@ public class AutoAccessibilityService extends AccessibilityService {
         }
     }
 
-    /**
-     * UI 树智能剪枝抓取算法：限制深度 <= 12，严格 recycle 回收 Binder 句柄，体积严格 <= 5KB (4500 字节安全预算)
-     */
     private JSONArray dumpCurrentUiPruned() {
         JSONArray array = new JSONArray();
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null) return array;
         try {
-            int[] currentBytes = new int[]{2}; // 初始计入 "[]" 2 字节
+            int[] currentBytes = new int[]{2};
             traverseAndPrune(root, array, 0, currentBytes);
         } finally {
             root.recycle();
@@ -578,121 +686,15 @@ public class AutoAccessibilityService extends AccessibilityService {
         } catch (Exception ignored) {}
     }
 
-    /**
-     * 端侧自主闭环：特来电打卡全自动化流水线
-     */
-    private void executeTeldPunchWorkflow(String rpcId) {
-        log(">>> [Workflow] 开始执行特来电端侧自主打卡任务...");
-        boolean success = false;
-        String finalStatus = "FAILED";
-
-        try {
-            // Step 1: 启动特来电
-            launchAppByName("com.qdtevc.teld.app");
-            Thread.sleep(4000);
-
-            // Step 2: 弹窗与广告清洗 (最多重试 6 次，每次间隔 1 秒)
-            for (int i = 0; i < 6; i++) {
-                if (clickByText("跳过") || clickByText("跳过广告")) {
-                    log("[Workflow] 已跳过开屏广告");
-                    Thread.sleep(1500);
-                }
-                if (clickById("com.qdtevc.teld.app:id/iv_close") || clickByText("关闭")) {
-                    log("[Workflow] 已关闭活动弹窗");
-                    Thread.sleep(1500);
-                }
-
-                AccessibilityNodeInfo root = getRootInActiveWindow();
-                if (root != null) {
-                    try {
-                        List<AccessibilityNodeInfo> nodes = root.findAccessibilityNodeInfosByText("打卡领好礼");
-                        if (nodes != null && !nodes.isEmpty()) {
-                            for (AccessibilityNodeInfo n : nodes) n.recycle();
-                            log("[Workflow] 首页已就绪，检测到【打卡领好礼】入口！");
-                            break;
-                        }
-                    } finally {
-                        root.recycle();
-                    }
-                }
-                // 兜底尝试点一次遮罩底部的关闭按钮区域 (x=360, y=1020 物理像素)
-                clickCoordinate(360, 1020);
-                Thread.sleep(1000);
-            }
-
-            // Step 3: 点击【打卡领好礼】
-            log("[Workflow] 正在点击【打卡领好礼】...");
-            boolean entryClicked = clickByText("打卡领好礼");
-            if (!entryClicked) {
-                clickCoordinate(360, 380);
-            }
-            Thread.sleep(4500);
-
-            // Step 4: 触发核心打卡动作：点击【点击完成今日打卡】
-            log("[Workflow] 正在查找并点击【点击完成今日打卡】...");
-            boolean punchClicked = false;
-            for (int i = 0; i < 5; i++) {
-                if (clickByText("点击完成今日打卡") || clickByText("完成今日打卡") || clickByText("今日打卡")) {
-                    log("[Workflow] 成功点击打卡按钮！");
-                    punchClicked = true;
-                    break;
-                }
-                Thread.sleep(1000);
-            }
-
-            if (!punchClicked) {
-                clickCoordinate(360, 1010);
-            }
-            Thread.sleep(2500);
-
-            // Step 5: 状态断言
-            AccessibilityNodeInfo root = getRootInActiveWindow();
-            if (root != null) {
-                try {
-                    List<AccessibilityNodeInfo> doneNodes = root.findAccessibilityNodeInfosByText("今日打卡已完成");
-                    if (doneNodes != null && !doneNodes.isEmpty()) {
-                        finalStatus = "ALREADY_PUNCHED (今日打卡已完成)";
-                        success = true;
-                        for (AccessibilityNodeInfo n : doneNodes) n.recycle();
-                    } else {
-                        finalStatus = "PUNCH_SUBMITTED (已触发打卡)";
-                        success = true;
-                    }
-                } finally {
-                    root.recycle();
-                }
-            } else {
-                finalStatus = "COMPLETED_WITHOUT_ROOT";
-                success = true;
-            }
-
-        } catch (Exception e) {
-            log("[Workflow] 打卡执行异常: " + e.getMessage());
-            finalStatus = "EXCEPTION: " + e.getMessage();
-        }
-
-        try {
-            JSONObject response = new JSONObject();
-            response.put("jsonrpc", "2.0");
-            response.put("id", rpcId);
-            response.put("__dir", "s2c");
-
-            JSONObject resultData = new JSONObject();
-            resultData.put("status", success ? "ok" : "fail");
-            resultData.put("workflow", "teld_punch");
-            resultData.put("detail", finalStatus);
-            response.put("result", resultData);
-
-            sendReply(response.toString());
-            log(">>> [Workflow] 最终打卡结果已回传至 PC 端: " + finalStatus);
-        } catch (Exception ignored) {}
-    }
-
     private void log(String msg) {
         Log.i(TAG, msg);
         if (logCallback != null) {
             mainHandler.post(() -> logCallback.onLog(msg));
         }
+    }
+
+    public void handleCommand(String jsonStr) {
+        dispatchRpcMessageAsync(jsonStr, null);
     }
 
     @Override public void onInterrupt() {}
@@ -701,6 +703,12 @@ public class AutoAccessibilityService extends AccessibilityService {
     public void onDestroy() {
         super.onDestroy();
         instance = null;
+        if (rpcServerSocket != null) {
+            try { rpcServerSocket.close(); } catch(Exception ignored) {}
+        }
+        if (rpcServerThread != null) {
+            rpcServerThread.interrupt();
+        }
         if (clipboardManager != null && clipListener != null) {
             clipboardManager.removePrimaryClipChangedListener(clipListener);
         }
