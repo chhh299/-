@@ -26,10 +26,12 @@ jobs:
         run: chmod +x gradlew
 
       - name: Build Debug APK
-        run: ./gradlew assembleDebug --no-daemon --no-build-cache --stacktrace
+        run: |
+          ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee build_output.txt
 
       - name: Upload APK to Artifacts
         uses: actions/upload-artifact@v4
+        if: success()
         with:
           name: cloud-auto-apk
           path: app/build/outputs/apk/debug/app-debug.apk
@@ -37,17 +39,26 @@ jobs:
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'
+        if: success()
         with:
           tag_name: v3.1.0
           name: Cloud Auto Service v3.1.0
           body: |
-            ## 139 移动云手机 - 无障碍自动化守护 APK
-            - 支持 WebRTC DataChannel 剪贴板指令监听
-            - 支持按文字、控件ID、坐标点击
-            - 支持免输入法文本直接赋值
-            - 支持全界面 UI 节点抓取并反向回传
-            - 针对 Android 10+ 锁定 targetSdk 28，确保后台免断连
+            ## 139 移动云手机 - 无障碍自动化守护 APK (局域网主动外连版)
+            - 支持界面动态填写对端 IP 与端口 (支持随时切换至 OpenWrt 或 PC)
+            - 启动 Client Socket 主动出站长连接，彻底解决入站防火墙与剪贴板限制
+            - 断线自动 5 秒重试机制
           files: app/build/outputs/apk/debug/app-debug.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish Failure Log to Release
+        uses: softprops/action-gh-release@v2
+        if: failure()
+        with:
+          tag_name: build-failure
+          name: Build Failure Log
+          body: "构建失败详细日志，供排查错误"
+          files: build_output.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
