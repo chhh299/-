@@ -27,16 +27,15 @@ jobs:
 
       - name: Build Debug APK
         run: |
-          set -o pipefail
-          ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee build_output.txt || (echo "=== GRADLE ERROR DETAILS ===" && tail -n 80 build_output.txt && exit 1)
-
-      - name: Upload APK to Artifacts
-        uses: actions/upload-artifact@v4
-        if: success()
-        with:
-          name: cloud-auto-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
-          retention-days: 7
+          ./gradlew assembleDebug --no-daemon --stacktrace > build_log.txt 2>&1 || (
+            echo "Build failed, pushing build_log.txt to git..."
+            git config user.name "chhh299"
+            git config user.email "chhh299@users.noreply.github.com"
+            git add build_log.txt
+            git commit -m "[00001] CI 捕获实际编译报错日志[AI-chhh299.Developer]"
+            git push origin main
+            exit 1
+          )
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -44,11 +43,6 @@ jobs:
         with:
           tag_name: v3.1.1
           name: Cloud Auto Service v3.1.1
-          body: |
-            ## 139 移动云手机 - 无障碍自动化守护 APK (局域网主动外连版)
-            - 支持界面动态填写对端 IP 与端口 (支持随时切换至 OpenWrt 或 PC)
-            - 启动 Client Socket 主动出站长连接，彻底解决入站防火墙与剪贴板限制
-            - 断线自动 5 秒重试机制
           files: app/build/outputs/apk/debug/app-debug.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
