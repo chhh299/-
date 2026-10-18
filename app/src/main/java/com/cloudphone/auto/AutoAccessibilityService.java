@@ -5,6 +5,7 @@ import android.accessibilityservice.GestureDescription;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
@@ -35,22 +36,28 @@ public class AutoAccessibilityService extends AccessibilityService {
     public static final String TAG = "CloudAutoService";
     public static AutoAccessibilityService instance = null;
 
-    // 避开 5555, 8080, 8000，使用专属局域网 TCP RPC 端口
-    public static final int TCP_RPC_PORT = 19388;
+    private static final String PREF_NAME = "cloud_auto_config";
+    private static final String KEY_IP = "target_ip";
+    private static final String KEY_PORT = "target_port";
 
     private ClipboardManager clipboardManager;
     private ClipboardManager.OnPrimaryClipChangedListener clipListener;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private String lastHandledRaw = "";
 
+    // 本地服务端监听 (可选)
     private ServerSocket rpcServerSocket = null;
     private Thread rpcServerThread = null;
 
-    // 实时前台状态追踪
+    // 主动出站长连接到对端 (PC 或 OpenWrt)
+    private Thread rpcClientThread = null;
+    private volatile boolean isClientRunning = true;
+    private String currentTargetIp = "192.168.193.51";
+    private int currentTargetPort = 19388;
+
     private String currentPackage = "";
     private String currentActivity = "";
 
-    // 权限与通用弹窗自动放行关键词
     private static final List<String> AUTO_DISMISS_TEXTS = Arrays.asList(
             "始终允许", "仅使用中允许", "允许", "我知道了", "同意并继续", "同意", "跳过", "以后再说"
     );
@@ -64,56 +71,99 @@ public class AutoAccessibilityService extends AccessibilityService {
     public void onServiceConnected() {
         super.onServiceConnected();
         instance = this;
-        log(">>> 无障碍守护服务 v3.0 已启动！同时监听 TCP:19388 与 剪贴板通道");
+        log(">>> 无障碍服务 v3.1 已连接！");
 
-        // 1. 启动局域网 TCP RPC 服务器 (端口 19388)
-        startTcpRpcServer();
+        // 读取用户配置的对端 IP 与端口 (支持随时在界面修改，部署到 OpenWrt)
+        SharedPreferences sp = getSharedPreferences(PREF_NAME, MODE_PRIVATE);
+        currentTargetIp = sp.getString(KEY_IP, "192.168.193.51");
+        currentTargetPort = sp.getInt(KEY_PORT, 19388);
 
-        // 2. 剪贴板监听备用通道
-        clipboardManager = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
-        if (clipboardManager != null) {
-            clipListener = new ClipboardManager.OnPrimaryClipChangedListener() {
-                @Override
-                public void onPrimaryClipChanged() {
-                    try {
-                        if (!clipboardManager.hasPrimaryClip()) return;
-                        ClipData clip = clipboardManager.getPrimaryClip();
-                        if (clip != null && clip.getItemCount() > 0) {
-                            CharSequence text = clip.getItemAt(0).getText();
-                            if (text != null) {
-                                String str = text.toString().trim();
-                                if (!str.contains("\"__dir\":\"c2s\"") && !str.contains("\"__dir\": \"c2s\"")) return;
-                                if (!str.equals(lastHandledRaw) && str.startsWith("{") && str.endsWith("}")) {
-                                    lastHandledRaw = str;
-                                    dispatchRpcMessageAsync(str, null);
-                                }
-                            }
-                        }
-                    } catch (Exception e) {
-                        log("剪贴板监听异常: " + e.getMessage());
-                    }
-                }
-            };
-            clipboardManager.addPrimaryClipChangedListener(clipListener);
+        // 1. 启动主动出站长连接线程 (连接 PC 或 OpenWrt)
+        startClientSocketLoop();
+
+        // 2. 启动本地监听备用 (端口 19388)
+        startLocalServerLoop(currentTargetPort);
+
+        // 3. 剪贴板监听备用
+        setupClipboardBackup();
+    }
+
+    public void reconnectClientSocket(String ip, int port) {
+        this.currentTargetIp = ip;
+        this.currentTargetPort = port;
+        log("[TCP] 用户更新对端目标: " + ip + ":" + port + "，正在重新建立连接...");
+        if (rpcClientThread != null) {
+            rpcClientThread.interrupt();
+            rpcClientThread = null;
         }
+        startClientSocketLoop();
     }
 
     /**
-     * 启动基于 TCP 19388 端口的原生局域网长连接服务
-     * 彻底突破任何 Android 剪贴板后台限制与 WebRTC 隔离！
+     * 主动向对端 (PC 或 OpenWrt 路由器) 发起长连接，断线自动 5 秒重试
+     * 彻底免疫云手机任何入站网络限制！
      */
-    private void startTcpRpcServer() {
+    private void startClientSocketLoop() {
+        if (rpcClientThread != null) return;
+        isClientRunning = true;
+
+        rpcClientThread = new Thread(() -> {
+            while (isClientRunning && !Thread.currentThread().isInterrupted()) {
+                Socket clientSocket = null;
+                try {
+                    log("[TCP] 正在主动连接对端: " + currentTargetIp + ":" + currentTargetPort + "...");
+                    clientSocket = new Socket(currentTargetIp, currentTargetPort);
+                    log("[TCP] 成功连上对端 MCP 服务器！(" + currentTargetIp + ":" + currentTargetPort + ")");
+
+                    BufferedReader reader = new BufferedReader(new InputStreamReader(clientSocket.getInputStream(), "UTF-8"));
+                    BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(clientSocket.getOutputStream(), "UTF-8"));
+
+                    while (isClientRunning && !clientSocket.isClosed()) {
+                        String line = reader.readLine();
+                        if (line == null) {
+                            log("[TCP] 对端已断开连接");
+                            break;
+                        }
+                        String trimmed = line.trim();
+                        if (!trimmed.isEmpty()) {
+                            log("[TCP 指令] " + trimmed);
+                            String resp = executeRpcSync(trimmed);
+                            writer.write(resp + "\n");
+                            writer.flush();
+                            log("[TCP 应答] 交付完成");
+                        }
+                    }
+                } catch (Exception e) {
+                    log("[TCP 连接中断/等待重试]: " + e.getMessage());
+                } finally {
+                    if (clientSocket != null) {
+                        try { clientSocket.close(); } catch (Exception ignored) {}
+                    }
+                }
+
+                // 断线后等待 5 秒重新尝试连接
+                try {
+                    Thread.sleep(5000);
+                } catch (InterruptedException e) {
+                    break;
+                }
+            }
+        });
+        rpcClientThread.start();
+    }
+
+    private void startLocalServerLoop(int port) {
         if (rpcServerThread != null) return;
         rpcServerThread = new Thread(() -> {
             try {
-                rpcServerSocket = new ServerSocket(TCP_RPC_PORT);
-                log(">>> [TCP Server] 已成功绑定并监听端口: " + TCP_RPC_PORT);
+                rpcServerSocket = new ServerSocket(port);
+                log("[TCP Server] 本地监听就绪: " + port);
                 while (!Thread.currentThread().isInterrupted()) {
                     Socket socket = rpcServerSocket.accept();
                     handleIncomingSocket(socket);
                 }
             } catch (Exception e) {
-                log("[TCP Server] 监听异常: " + e.getMessage());
+                log("[TCP Server 异常]: " + e.getMessage());
             }
         });
         rpcServerThread.start();
@@ -124,26 +174,43 @@ public class AutoAccessibilityService extends AccessibilityService {
             try {
                 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), "UTF-8"));
                 BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), "UTF-8"));
-
-                String reqLine = reader.readLine();
-                if (reqLine != null && !reqLine.trim().isEmpty()) {
-                    log("[TCP Recv] " + reqLine);
-                    String respLine = executeRpcSync(reqLine.trim());
-                    writer.write(respLine + "\n");
+                String line = reader.readLine();
+                if (line != null && !line.trim().isEmpty()) {
+                    String resp = executeRpcSync(line.trim());
+                    writer.write(resp + "\n");
                     writer.flush();
-                    log("[TCP Sent] 响应回写完毕");
                 }
-            } catch (Exception e) {
-                log("[TCP Handler] 客户端交互异常: " + e.getMessage());
+            } catch (Exception ignored) {
             } finally {
                 try { socket.close(); } catch (Exception ignored) {}
             }
         }).start();
     }
 
-    /**
-     * 同步执行 RPC 指令并返回响应 JSON
-     */
+    private void setupClipboardBackup() {
+        clipboardManager = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        if (clipboardManager != null) {
+            clipListener = () -> {
+                try {
+                    if (!clipboardManager.hasPrimaryClip()) return;
+                    ClipData clip = clipboardManager.getPrimaryClip();
+                    if (clip != null && clip.getItemCount() > 0) {
+                        CharSequence text = clip.getItemAt(0).getText();
+                        if (text != null) {
+                            String str = text.toString().trim();
+                            if (!str.contains("\"__dir\":\"c2s\"") && !str.contains("\"__dir\": \"c2s\"")) return;
+                            if (!str.equals(lastHandledRaw) && str.startsWith("{") && str.endsWith("}")) {
+                                lastHandledRaw = str;
+                                dispatchRpcMessageAsync(str, null);
+                            }
+                        }
+                    }
+                } catch (Exception ignored) {}
+            };
+            clipboardManager.addPrimaryClipChangedListener(clipListener);
+        }
+    }
+
     public String executeRpcSync(String jsonStr) {
         final CountDownLatch latch = new CountDownLatch(1);
         final AtomicReference<String> responseRef = new AtomicReference<>("");
@@ -154,7 +221,7 @@ public class AutoAccessibilityService extends AccessibilityService {
         });
 
         try {
-            boolean done = latch.await(15, TimeUnit.SECONDS);
+            boolean done = latch.await(20, TimeUnit.SECONDS);
             if (!done) {
                 JSONObject timeoutResp = new JSONObject();
                 timeoutResp.put("jsonrpc", "2.0");
@@ -172,11 +239,8 @@ public class AutoAccessibilityService extends AccessibilityService {
         void onResponse(String jsonResponse);
     }
 
-    /**
-     * 标准 JSON-RPC 2.0 异步消息路由分发
-     */
     public void dispatchRpcMessageAsync(String jsonStr, ResponseCallback callback) {
-        log("处理指令: " + jsonStr);
+        final ResponseCallback finalCallback = callback;
         mainHandler.post(() -> {
             String rpcId = "0";
             try {
@@ -203,7 +267,7 @@ public class AutoAccessibilityService extends AccessibilityService {
 
                     case "teld_punch_workflow":
                     case "teld_punch":
-                        new Thread(() -> executeTeldPunchWorkflow(finalRpcId, callback)).start();
+                        new Thread(() -> executeTeldPunchWorkflow(finalRpcId, finalCallback)).start();
                         return;
 
                     case "launch_app":
@@ -286,14 +350,13 @@ public class AutoAccessibilityService extends AccessibilityService {
                 }
 
                 String respStr = response.toString();
-                if (callback != null) {
-                    callback.onResponse(respStr);
+                if (finalCallback != null) {
+                    finalCallback.onResponse(respStr);
                 } else {
                     sendReply(respStr);
                 }
 
             } catch (Exception e) {
-                log("RPC 处理异常: " + e.getMessage());
                 try {
                     JSONObject errResp = new JSONObject();
                     errResp.put("jsonrpc", "2.0");
@@ -301,8 +364,8 @@ public class AutoAccessibilityService extends AccessibilityService {
                     errResp.put("__dir", "s2c");
                     errResp.put("error", makeError(-32603, "Internal error: " + e.getMessage()));
                     String errStr = errResp.toString();
-                    if (callback != null) {
-                        callback.onResponse(errStr);
+                    if (finalCallback != null) {
+                        finalCallback.onResponse(errStr);
                     } else {
                         sendReply(errStr);
                     }
@@ -311,29 +374,24 @@ public class AutoAccessibilityService extends AccessibilityService {
         });
     }
 
-    /**
-     * 端侧自主闭环打卡流水线
-     */
     private void executeTeldPunchWorkflow(String rpcId, ResponseCallback callback) {
-        log(">>> [Workflow] 开始执行特来电打卡工作流...");
+        log(">>> [Workflow] 开始执行特来电打卡流水线...");
         boolean success = false;
         String finalStatus = "FAILED";
 
         try {
-            // 1. 先发 Home 回桌面，再拉起特来电 (防止后台 Activity 拦截)
             handleGlobalAction("home");
             Thread.sleep(1000);
             launchAppByName("com.qdtevc.teld.app");
             Thread.sleep(4000);
 
-            // 2. 弹窗清洗 (最多重试 5 次)
             for (int i = 0; i < 5; i++) {
                 if (clickByText("跳过") || clickByText("跳过广告")) {
-                    log("[Workflow] 跳过开屏广告");
+                    log("[Workflow] 跳过广告");
                     Thread.sleep(1200);
                 }
                 if (clickById("com.qdtevc.teld.app:id/iv_close") || clickByText("关闭")) {
-                    log("[Workflow] 点击关闭弹窗");
+                    log("[Workflow] 关闭弹窗");
                     Thread.sleep(1200);
                 }
 
@@ -343,7 +401,7 @@ public class AutoAccessibilityService extends AccessibilityService {
                         List<AccessibilityNodeInfo> nodes = root.findAccessibilityNodeInfosByText("打卡领好礼");
                         if (nodes != null && !nodes.isEmpty()) {
                             for (AccessibilityNodeInfo n : nodes) n.recycle();
-                            log("[Workflow] 检测到【打卡领好礼】入口，首页已就绪！");
+                            log("[Workflow] 金刚区就绪！");
                             break;
                         }
                     } finally {
@@ -353,23 +411,20 @@ public class AutoAccessibilityService extends AccessibilityService {
                 Thread.sleep(800);
             }
 
-            // 3. 点击【打卡领好礼】(语义优先)
-            log("[Workflow] 点击【打卡领好礼】入口...");
+            log("[Workflow] 点击【打卡领好礼】...");
             clickByText("打卡领好礼");
             Thread.sleep(4500);
 
-            // 4. 寻找并点击核心打卡按钮【点击完成今日打卡】
             log("[Workflow] 点击【点击完成今日打卡】...");
             for (int i = 0; i < 6; i++) {
                 if (clickByText("点击完成今日打卡") || clickByText("完成今日打卡") || clickByText("今日打卡")) {
-                    log("[Workflow] 成功点击打卡按钮！");
+                    log("[Workflow] 成功命中打卡按钮！");
                     break;
                 }
                 Thread.sleep(1000);
             }
             Thread.sleep(2000);
 
-            // 5. 状态断言
             AccessibilityNodeInfo root = getRootInActiveWindow();
             if (root != null) {
                 try {
@@ -391,7 +446,6 @@ public class AutoAccessibilityService extends AccessibilityService {
             }
 
         } catch (Exception e) {
-            log("[Workflow] 异常: " + e.getMessage());
             finalStatus = "EXCEPTION: " + e.getMessage();
         }
 
@@ -413,7 +467,7 @@ public class AutoAccessibilityService extends AccessibilityService {
             } else {
                 sendReply(respStr);
             }
-            log(">>> [Workflow] 打卡结果交付完成: " + finalStatus);
+            log(">>> [Workflow] 结果交付完成: " + finalStatus);
         } catch (Exception ignored) {}
     }
 
@@ -464,9 +518,7 @@ public class AutoAccessibilityService extends AccessibilityService {
                 item.put("activity", act);
                 arr.put(item);
             }
-        } catch (Exception e) {
-            log("listInstalledApps 异常: " + e.getMessage());
-        }
+        } catch (Exception ignored) {}
         return arr;
     }
 
@@ -477,7 +529,6 @@ public class AutoAccessibilityService extends AccessibilityService {
             if (intent != null) {
                 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
                 startActivity(intent);
-                log("显式包名拉起应用: " + identifier);
                 return true;
             }
 
@@ -489,14 +540,11 @@ public class AutoAccessibilityService extends AccessibilityService {
                     if (intent != null) {
                         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
                         startActivity(intent);
-                        log("中文标签匹配拉起应用: " + label + " (" + app.packageName + ")");
                         return true;
                     }
                 }
             }
-        } catch (Exception e) {
-            log("启动应用异常: " + e.getMessage());
-        }
+        } catch (Exception ignored) {}
         return false;
     }
 
@@ -703,6 +751,10 @@ public class AutoAccessibilityService extends AccessibilityService {
     public void onDestroy() {
         super.onDestroy();
         instance = null;
+        isClientRunning = false;
+        if (rpcClientThread != null) {
+            rpcClientThread.interrupt();
+        }
         if (rpcServerSocket != null) {
             try { rpcServerSocket.close(); } catch(Exception ignored) {}
         }

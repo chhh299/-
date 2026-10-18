@@ -12,8 +12,8 @@ android {
         // 注意：特别固定 targetSdk 为 28 (Android 9 Pie)
         // 避开 Android 10+ (API 29+) 对后台剪贴板监听的权限封锁，确保后台长连接常驻
         targetSdk 28
-        versionCode 7
-        versionName "3.0.0"
+        versionCode 8
+        versionName "3.1.0"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
