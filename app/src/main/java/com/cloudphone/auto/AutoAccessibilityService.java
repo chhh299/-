@@ -2,6 +2,9 @@ package com.cloudphone.auto;
 
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
@@ -10,12 +13,14 @@ import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.graphics.Path;
 import android.graphics.Rect;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
+import androidx.core.app.NotificationCompat;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -25,6 +30,9 @@ import java.util.List;
 public class AutoAccessibilityService extends AccessibilityService {
     public static final String TAG = "CloudAutoService";
     public static AutoAccessibilityService instance = null;
+
+    private static final String CHANNEL_ID = "cloud_auto_daemon_channel";
+    private static final int NOTIFICATION_ID = 1001;
 
     private ClipboardManager clipboardManager;
     private ClipboardManager.OnPrimaryClipChangedListener clipListener;
@@ -51,6 +59,9 @@ public class AutoAccessibilityService extends AccessibilityService {
         instance = this;
         log(">>> 无障碍守护服务 v2.0 已连接！全量应用自发现与 JSON-RPC 2.0 已就绪");
 
+        // 启动前台服务通知保活 (Foreground Service Keep-Alive)
+        startForegroundKeepAlive();
+
         clipboardManager = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
         if (clipboardManager != null) {
             clipListener = new ClipboardManager.OnPrimaryClipChangedListener() {
@@ -63,9 +74,11 @@ public class AutoAccessibilityService extends AccessibilityService {
                             CharSequence text = clip.getItemAt(0).getText();
                             if (text != null) {
                                 String str = text.toString().trim();
-                                // 1. 回环防御：若为自身发出的 s2c 响应，直接丢弃
-                                if (str.contains("\"__dir\":\"s2c\"") || str.contains("\"__dir\": \"s2c\"") || str.contains("\"reply_for\"")) return;
-                                // 2. 防重放校验
+                                // 核心回环防守：仅受理明确携带下行签名 "__dir":"c2s" 的控制报文
+                                if (!str.contains("\"__dir\":\"c2s\"") && !str.contains("\"__dir\": \"c2s\"")) {
+                                    return;
+                                }
+                                // 防重放校验
                                 if (!str.equals(lastHandledRaw) && str.startsWith("{") && str.endsWith("}")) {
                                     lastHandledRaw = str;
                                     dispatchRpcMessage(str);
@@ -78,6 +91,32 @@ public class AutoAccessibilityService extends AccessibilityService {
                 }
             };
             clipboardManager.addPrimaryClipChangedListener(clipListener);
+        }
+    }
+
+    private void startForegroundKeepAlive() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                NotificationChannel channel = new NotificationChannel(
+                        CHANNEL_ID,
+                        "云机自动化守护服务",
+                        NotificationManager.IMPORTANCE_LOW
+                );
+                channel.setDescription("保持云手机无障碍自动化长连接常驻运行");
+                NotificationManager nm = getSystemService(NotificationManager.class);
+                if (nm != null) nm.createNotificationChannel(channel);
+            }
+
+            Notification notification = new NotificationCompat.Builder(this, CHANNEL_ID)
+                    .setContentTitle("云机自动化助手已常驻")
+                    .setContentText("正在监听 WebRTC RPC 控制指令")
+                    .setSmallIcon(android.R.drawable.sym_def_app_icon)
+                    .setPriority(NotificationCompat.PRIORITY_LOW)
+                    .build();
+
+            startForeground(NOTIFICATION_ID, notification);
+        } catch (Exception e) {
+            log("启动前台通知保活异常: " + e.getMessage());
         }
     }
 
@@ -101,7 +140,7 @@ public class AutoAccessibilityService extends AccessibilityService {
     }
 
     /**
-     * 自动检测并点击系统权限弹窗或通用对话框
+     * 自动检测并点击系统权限弹窗或通用对话框，且确保所有节点绝对安全回收
      */
     private void autoDismissPopups() {
         AccessibilityNodeInfo root = getRootInActiveWindow();
@@ -109,17 +148,16 @@ public class AutoAccessibilityService extends AccessibilityService {
         try {
             for (String keyword : AUTO_DISMISS_TEXTS) {
                 List<AccessibilityNodeInfo> nodes = root.findAccessibilityNodeInfosByText(keyword);
-                if (nodes != null && !nodes.isEmpty()) {
+                if (nodes != null) {
+                    boolean dismissed = false;
                     for (AccessibilityNodeInfo node : nodes) {
-                        try {
-                            if (performClick(node)) {
-                                log("【自动清障】已自动放行弹窗按钮: " + keyword);
-                                return;
-                            }
-                        } finally {
-                            node.recycle();
+                        if (!dismissed && performClick(node, true)) {
+                            log("【自动清障】已自动放行弹窗按钮: " + keyword);
+                            dismissed = true;
                         }
+                        node.recycle();
                     }
+                    if (dismissed) return;
                 }
             }
         } catch (Exception ignored) {
@@ -128,9 +166,6 @@ public class AutoAccessibilityService extends AccessibilityService {
         }
     }
 
-    /**
-     * 外部/测试触发接口
-     */
     public void handleCommand(String jsonStr) {
         dispatchRpcMessage(jsonStr);
     }
@@ -138,18 +173,17 @@ public class AutoAccessibilityService extends AccessibilityService {
     /**
      * 标准 JSON-RPC 2.0 消息路由器
      */
-    public void dispatchRpcMessage(String jsonStr) {
+    private void dispatchRpcMessage(String jsonStr) {
         log("收到控制报文: " + jsonStr);
         mainHandler.post(() -> {
             String rpcId = "0";
             try {
                 JSONObject json = new JSONObject(jsonStr);
 
-                // 兼容标准 JSON-RPC 2.0 与旧版格式
                 String method = json.optString("method", json.optString("action"));
                 rpcId = json.optString("id", String.valueOf(System.currentTimeMillis()));
                 JSONObject params = json.optJSONObject("params");
-                if (params == null) params = json; // 平铺参数兼容
+                if (params == null) params = json;
 
                 JSONObject resultData = new JSONObject();
                 JSONObject errorObj = null;
@@ -231,16 +265,16 @@ public class AutoAccessibilityService extends AccessibilityService {
                         break;
                 }
 
-                // 组装标准 JSON-RPC 2.0 响应 (携带 __dir: "s2c")
+                // 核心防自激回环：顶层强制注入 __dir: "s2c"，确保任何分支均具备上行签名
                 JSONObject response = new JSONObject();
                 response.put("jsonrpc", "2.0");
                 response.put("id", rpcId);
-                resultData.put("__dir", "s2c");
-                resultData.put("status", errorObj == null ? "ok" : "fail");
+                response.put("__dir", "s2c");
 
                 if (errorObj != null) {
                     response.put("error", errorObj);
                 } else {
+                    resultData.put("status", "ok");
                     response.put("result", resultData);
                 }
 
@@ -253,6 +287,7 @@ public class AutoAccessibilityService extends AccessibilityService {
                     JSONObject errResp = new JSONObject();
                     errResp.put("jsonrpc", "2.0");
                     errResp.put("id", rpcId);
+                    errResp.put("__dir", "s2c"); // 异常捕获同样强制注入 __dir: "s2c"
                     errResp.put("error", makeError(-32603, "Internal error: " + e.getMessage()));
                     sendReply(errResp.toString());
                 } catch (Exception ignored) {}
@@ -311,7 +346,6 @@ public class AutoAccessibilityService extends AccessibilityService {
     private boolean launchAppByName(String identifier) {
         try {
             PackageManager pm = getPackageManager();
-            // 1. 若直接是合法包名，尝试直连
             Intent intent = pm.getLaunchIntentForPackage(identifier);
             if (intent != null) {
                 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
@@ -320,7 +354,6 @@ public class AutoAccessibilityService extends AccessibilityService {
                 return true;
             }
 
-            // 2. 遍历查找匹配中文名称
             List<ApplicationInfo> apps = pm.getInstalledApplications(0);
             for (ApplicationInfo app : apps) {
                 String label = pm.getApplicationLabel(app).toString();
@@ -340,65 +373,69 @@ public class AutoAccessibilityService extends AccessibilityService {
         return false;
     }
 
-    /** 按文字查找并点击（支持向父节点回溯及坐标中心点回退保底） */
+    /** 按文字查找并点击，且安全回收列表全部节点 */
     private boolean clickByText(String text) {
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null) return false;
+        boolean clicked = false;
         try {
             List<AccessibilityNodeInfo> list = root.findAccessibilityNodeInfosByText(text);
-            if (list != null && !list.isEmpty()) {
+            if (list != null) {
                 for (AccessibilityNodeInfo node : list) {
-                    try {
-                        if (performClick(node)) return true;
-                    } finally {
-                        node.recycle();
+                    if (!clicked && performClick(node, true)) {
+                        clicked = true;
                     }
+                    node.recycle(); // 确保遍历完列表中的每个节点都显式 recycle
                 }
             }
         } finally {
             root.recycle();
         }
-        return false;
+        return clicked;
     }
 
-    /** 按控件 ID 查找并点击 */
+    /** 按控件 ID 查找并点击，且安全回收列表全部节点 */
     private boolean clickById(String viewId) {
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null) return false;
+        boolean clicked = false;
         try {
             List<AccessibilityNodeInfo> list = root.findAccessibilityNodeInfosByViewId(viewId);
-            if (list != null && !list.isEmpty()) {
+            if (list != null) {
                 for (AccessibilityNodeInfo node : list) {
-                    try {
-                        if (performClick(node)) return true;
-                    } finally {
-                        node.recycle();
+                    if (!clicked && performClick(node, true)) {
+                        clicked = true;
                     }
+                    node.recycle();
                 }
             }
         } finally {
             root.recycle();
         }
-        return false;
+        return clicked;
     }
 
     /**
-     * 三级级联降级点击保底
+     * 三级级联降级点击保底：限制父节点最多回溯一层，未命中直接点击当前目标矩形中心
      */
-    private boolean performClick(AccessibilityNodeInfo node) {
+    private boolean performClick(AccessibilityNodeInfo node, boolean allowParent) {
         if (node == null) return false;
         if (node.isClickable()) {
             return node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
         }
-        AccessibilityNodeInfo parent = node.getParent();
-        if (parent != null) {
-            try {
-                if (performClick(parent)) return true;
-            } finally {
-                parent.recycle();
+        if (allowParent) {
+            AccessibilityNodeInfo parent = node.getParent();
+            if (parent != null) {
+                try {
+                    if (parent.isClickable() && parent.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                        return true;
+                    }
+                } finally {
+                    parent.recycle();
+                }
             }
         }
-        // 关键兜底：获取节点物理外接矩形中心，发送原生触摸手势
+        // 关键兜底：获取当前目标节点自身的屏幕物理外接矩形中心，发送原生触摸手势
         Rect rect = new Rect();
         node.getBoundsInScreen(rect);
         if (rect.width() > 0 && rect.height() > 0) {
@@ -416,7 +453,12 @@ public class AutoAccessibilityService extends AccessibilityService {
             AccessibilityNodeInfo target = null;
             if (viewId != null && !viewId.isEmpty()) {
                 List<AccessibilityNodeInfo> list = root.findAccessibilityNodeInfosByViewId(viewId);
-                if (list != null && !list.isEmpty()) target = list.get(0);
+                if (list != null) {
+                    for (AccessibilityNodeInfo n : list) {
+                        if (target == null) target = n;
+                        else n.recycle();
+                    }
+                }
             }
             if (target == null) {
                 target = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
@@ -491,7 +533,6 @@ public class AutoAccessibilityService extends AccessibilityService {
             String resId = node.getViewIdResourceName();
             boolean clickable = node.isClickable();
 
-            // 智能剪枝：仅保留具备有效交互特征的节点
             if ((text != null && text.length() > 0) || (desc != null && desc.length() > 0) || clickable || resId != null) {
                 Rect rect = new Rect();
                 node.getBoundsInScreen(rect);
@@ -506,12 +547,12 @@ public class AutoAccessibilityService extends AccessibilityService {
                     item.put("w", rect.width());
                     item.put("h", rect.height());
 
-                    int itemLen = item.toString().getBytes("UTF-8").length + 1; // 计入逗号
+                    int itemLen = item.toString().getBytes("UTF-8").length + 1;
                     if (currentBytes[0] + itemLen <= 4500) {
                         array.put(item);
                         currentBytes[0] += itemLen;
                     } else {
-                        return; // 超出 4.5KB 严格预算即刻停止收集
+                        return;
                     }
                 }
             }
@@ -524,7 +565,7 @@ public class AutoAccessibilityService extends AccessibilityService {
                     try {
                         traverseAndPrune(child, array, depth + 1, currentBytes);
                     } finally {
-                        child.recycle(); // 强制显式释放 Binder 代理句柄，杜绝死锁假死
+                        child.recycle();
                     }
                 }
             }
